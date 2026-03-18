@@ -10,8 +10,8 @@ import (
 	"net"
 	"time"
 
-	hadoop_common "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_common"
-	hdfs "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_hdfs"
+	hadoop_common "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_common"
+	hdfs "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_hdfs"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -33,12 +33,13 @@ type BlockReader struct {
 	// (&net.Dialer{}).DialContext is used.
 	DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	datanodes      *datanodeFailover
-	datanodeTokens map[string]*hadoop_common.TokenProto
-	stream         *blockReadStream
-	conn           net.Conn
-	deadline       time.Time
-	closed         bool
+	datanodes       *datanodeFailover
+	datanodeTokens  map[string]*hadoop_common.TokenProto
+	datanodeIndices map[string]byte
+	stream          *blockReadStream
+	conn            net.Conn
+	deadline        time.Time
+	closed          bool
 }
 
 const maxSkip = 65536
@@ -82,12 +83,19 @@ func (br *BlockReader) Read(b []byte) (int, error) {
 		br.datanodes = newDatanodeFailover(datanodes)
 
 		// For EC (striped) blocks, each datanode holds an internal block with its
-		// own token stored in blockTokens. Build a map from address to token so
-		// that connectNext can send the correct token for each datanode.
+		// own token and block index stored in blockTokens/blockIndices.
+		// Build maps from address to token and block index so that connectNext
+		// can send the correct internal block ID and token for each datanode.
 		if blockTokens := br.Block.GetBlockTokens(); len(blockTokens) == len(locs) {
 			br.datanodeTokens = make(map[string]*hadoop_common.TokenProto, len(locs))
 			for i, token := range blockTokens {
 				br.datanodeTokens[datanodes[i]] = token
+			}
+		}
+		if blockIndices := br.Block.GetBlockIndices(); len(blockIndices) == len(locs) {
+			br.datanodeIndices = make(map[string]byte, len(locs))
+			for i, idx := range blockIndices {
+				br.datanodeIndices[datanodes[i]] = idx
 			}
 		}
 	}
@@ -254,17 +262,25 @@ func (br *BlockReader) connectNext() error {
 func (br *BlockReader) writeBlockReadRequest(w io.Writer, address string) error {
 	needed := br.Block.GetB().GetNumBytes() - uint64(br.Offset)
 
-	// For EC (striped) blocks, each datanode uses a per-datanode token rather
-	// than the single shared blockToken used for replicated blocks.
+	// For EC (striped) blocks, each datanode uses a per-datanode token and
+	// holds an internal block whose ID = groupBlockId + blockIndex.
 	token := br.Block.GetBlockToken()
 	if t, ok := br.datanodeTokens[address]; ok {
 		token = t
 	}
 
+	block := br.Block.GetB()
+	if idx, ok := br.datanodeIndices[address]; ok {
+		// Compute the internal block ID for this datanode's shard.
+		internalID := block.GetBlockId() + uint64(idx)
+		block = proto.Clone(block).(*hdfs.ExtendedBlockProto)
+		block.BlockId = proto.Uint64(internalID)
+	}
+
 	op := &hdfs.OpReadBlockProto{
 		Header: &hdfs.ClientOperationHeaderProto{
 			BaseHeader: &hdfs.BaseHeaderProto{
-				Block: br.Block.GetB(),
+				Block: block,
 				Token: token,
 			},
 			ClientName: proto.String(br.ClientName),

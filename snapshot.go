@@ -1,7 +1,7 @@
 package hdfs
 
 import (
-	hdfs "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_hdfs"
+	hdfs "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_hdfs"
 )
 
 // AllowSnapshots marks a directory as available for snapshots.

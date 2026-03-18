@@ -7,8 +7,9 @@ import (
 	"net"
 	"time"
 
-	hadoop_common "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_common"
-	hdfs "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_hdfs"
+	hadoop_common "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_common"
+	hdfs "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_hdfs"
+	"google.golang.org/protobuf/proto"
 )
 
 // ChecksumReader provides an interface for reading the "MD5CRC32" checksums of
@@ -23,9 +24,10 @@ type ChecksumReader struct {
 	// DialFunc is used to connect to the datanodes. If nil, then (&net.Dialer{}).DialContext is used
 	DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	deadline       time.Time
-	datanodes      *datanodeFailover
-	datanodeTokens map[string]*hadoop_common.TokenProto
+	deadline        time.Time
+	datanodes       *datanodeFailover
+	datanodeTokens  map[string]*hadoop_common.TokenProto
+	datanodeIndices map[string]byte
 }
 
 // SetDeadline sets the deadline for future ReadChecksum calls. A zero value
@@ -49,12 +51,19 @@ func (cr *ChecksumReader) ReadChecksum() ([]byte, error) {
 		cr.datanodes = newDatanodeFailover(datanodes)
 
 		// For EC (striped) blocks, each datanode holds an internal block with its
-		// own token stored in blockTokens. Build a map from address to token so
-		// that readChecksum can send the correct token for each datanode.
+		// own token and block index. Build maps from address to token and block
+		// index so that readChecksum can send the correct internal block ID and
+		// token for each datanode.
 		if blockTokens := cr.Block.GetBlockTokens(); len(blockTokens) == len(locs) {
 			cr.datanodeTokens = make(map[string]*hadoop_common.TokenProto, len(locs))
 			for i, token := range blockTokens {
 				cr.datanodeTokens[datanodes[i]] = token
+			}
+		}
+		if blockIndices := cr.Block.GetBlockIndices(); len(blockIndices) == len(locs) {
+			cr.datanodeIndices = make(map[string]byte, len(locs))
+			for i, idx := range blockIndices {
+				cr.datanodeIndices[datanodes[i]] = idx
 			}
 		}
 	}
@@ -117,13 +126,21 @@ func (cr *ChecksumReader) readChecksum(address string) ([]byte, error) {
 func (cr *ChecksumReader) writeBlockChecksumRequest(w io.Writer, address string) error {
 	header := []byte{0x00, dataTransferVersion, checksumBlockOp}
 
-	// For EC (striped) blocks, use the per-datanode token if available.
+	// For EC (striped) blocks, use the per-datanode token and internal block ID.
 	token := cr.Block.GetBlockToken()
 	if t, ok := cr.datanodeTokens[address]; ok {
 		token = t
 	}
 
-	op := newChecksumBlockOp(cr.Block, token)
+	block := cr.Block.GetB()
+	if idx, ok := cr.datanodeIndices[address]; ok {
+		// Compute the internal block ID for this datanode's shard.
+		internalID := block.GetBlockId() + uint64(idx)
+		block = proto.Clone(block).(*hdfs.ExtendedBlockProto)
+		block.BlockId = proto.Uint64(internalID)
+	}
+
+	op := newChecksumBlockOp(block, token)
 	opBytes, err := makePrefixedMessage(op)
 	if err != nil {
 		return err
@@ -148,10 +165,10 @@ func (cr *ChecksumReader) readBlockChecksumResponse(r io.Reader) (*hdfs.BlockOpR
 	return resp, err
 }
 
-func newChecksumBlockOp(block *hdfs.LocatedBlockProto, token *hadoop_common.TokenProto) *hdfs.OpBlockChecksumProto {
+func newChecksumBlockOp(block *hdfs.ExtendedBlockProto, token *hadoop_common.TokenProto) *hdfs.OpBlockChecksumProto {
 	return &hdfs.OpBlockChecksumProto{
 		Header: &hdfs.BaseHeaderProto{
-			Block: block.GetB(),
+			Block: block,
 			Token: token,
 		},
 	}

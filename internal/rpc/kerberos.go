@@ -7,8 +7,8 @@ import (
 	"regexp"
 	"sort"
 
-	hadoop "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_common"
-	"github.com/colinmarc/hdfs/v2/internal/sasl"
+	hadoop "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_common"
+	"github.com/timrobertson100/hdfs/v2/internal/sasl"
 	"github.com/jcmturner/gokrb5/v8/gssapi"
 	"github.com/jcmturner/gokrb5/v8/iana/keyusage"
 	"github.com/jcmturner/gokrb5/v8/spnego"

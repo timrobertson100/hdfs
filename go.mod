@@ -1,4 +1,4 @@
-module github.com/colinmarc/hdfs/v2
+module github.com/timrobertson100/hdfs/v2
 
 require (
 	github.com/jcmturner/gokrb5/v8 v8.4.4
