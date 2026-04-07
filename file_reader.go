@@ -1,13 +1,16 @@
 package hdfs
 
 import (
+	"context"
 	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"time"
 
+	hadoop "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_common"
 	hdfs "github.com/timrobertson100/hdfs/v2/internal/protocol/hadoop_hdfs"
 	"github.com/timrobertson100/hdfs/v2/internal/transfer"
 	"google.golang.org/protobuf/proto"
@@ -22,7 +25,8 @@ type FileReader struct {
 	info   os.FileInfo
 
 	blocks      []*hdfs.LocatedBlockProto
-	blockReader *transfer.BlockReader
+	ecPolicy    *hdfs.ErasureCodingPolicyProto
+	blockReader transfer.BlockReadCloser
 	deadline    time.Time
 	offset      int64
 
@@ -405,6 +409,7 @@ func (f *FileReader) getBlocks() error {
 	}
 
 	f.blocks = resp.GetLocations().GetBlocks()
+	f.ecPolicy = resp.GetLocations().GetEcPolicy()
 	return nil
 }
 
@@ -415,19 +420,43 @@ func (f *FileReader) getNewBlockReader() error {
 		end := start + block.GetB().GetNumBytes()
 
 		if start <= off && off < end {
-			dialFunc, err := f.client.wrapDatanodeDial(
-				f.client.options.DatanodeDialFunc,
-				block.GetBlockToken())
-			if err != nil {
-				return err
-			}
+			// For EC (striped) blocks the block has per-datanode tokens and
+			// indices, and requires reading from multiple datanodes in cell
+			// order. Use StripedBlockReader in that case.
+			if len(block.GetBlockIndices()) > 0 && f.ecPolicy != nil {
+				// Build a WrapDialFunc so each data-unit connection can be
+				// authenticated with its own per-unit token.
+				wrapDial := func(
+					dc func(ctx context.Context, network, addr string) (net.Conn, error),
+					token *hadoop.TokenProto,
+				) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
+					return f.client.wrapDatanodeDial(dc, token)
+				}
 
-			f.blockReader = &transfer.BlockReader{
-				ClientName:          f.client.namenode.ClientName,
-				Block:               block,
-				Offset:              int64(off - start),
-				UseDatanodeHostname: f.client.options.UseDatanodeHostname,
-				DialFunc:            dialFunc,
+				f.blockReader = &transfer.StripedBlockReader{
+					ClientName:          f.client.namenode.ClientName,
+					Block:               block,
+					Offset:              int64(off - start),
+					ECPolicy:            f.ecPolicy,
+					UseDatanodeHostname: f.client.options.UseDatanodeHostname,
+					DialFunc:            f.client.options.DatanodeDialFunc,
+					WrapDialFunc:        wrapDial,
+				}
+			} else {
+				dialFunc, err := f.client.wrapDatanodeDial(
+					f.client.options.DatanodeDialFunc,
+					block.GetBlockToken())
+				if err != nil {
+					return err
+				}
+
+				f.blockReader = &transfer.BlockReader{
+					ClientName:          f.client.namenode.ClientName,
+					Block:               block,
+					Offset:              int64(off - start),
+					UseDatanodeHostname: f.client.options.UseDatanodeHostname,
+					DialFunc:            dialFunc,
+				}
 			}
 
 			return f.SetDeadline(f.deadline)
